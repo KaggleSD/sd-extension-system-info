@@ -9,9 +9,9 @@ import logging
 from html.parser import HTMLParser
 import torch
 import gradio as gr
-from modules import paths, script_callbacks, sd_models, sd_samplers, shared, extensions, devices
+from modules import paths, script_callbacks, sd_hijack, sd_models, sd_samplers, shared, extensions, devices
 from benchmark import run_benchmark, submit_benchmark # pylint: disable=E0401,E0611,C0411
-
+import pynvml
 
 ### system info globals
 
@@ -88,24 +88,24 @@ def get_gpu():
         try:
             if hasattr(torch, "xpu") and torch.xpu.is_available():
                 return {
-                    'device': f'{torch.xpu.get_device_name(torch.xpu.current_device())} ({str(torch.xpu.device_count())})',
+                    'GPU 设备': f'{torch.xpu.get_device_name(torch.xpu.current_device())} ({str(torch.xpu.device_count())})',
                     'ipex': get_package_version('intel-extension-for-pytorch'),
                 }
             elif torch.version.cuda:
                 return {
-                    'device': f'{torch.cuda.get_device_name(torch.cuda.current_device())} ({str(torch.cuda.device_count())}) ({torch.cuda.get_arch_list()[-1]}) {str(torch.cuda.get_device_capability(shared.device))}',
+                    'GPU 设备': f'{torch.cuda.get_device_name(torch.cuda.current_device())} ({str(torch.cuda.device_count())}) ({torch.cuda.get_arch_list()[-1]}) {str(torch.cuda.get_device_capability(shared.device))}',
                     'cuda': torch.version.cuda,
                     'cudnn': torch.backends.cudnn.version(),
                     'driver': get_driver(),
                 }
             elif torch.version.hip:
                 return {
-                    'device': f'{torch.cuda.get_device_name(torch.cuda.current_device())} ({str(torch.cuda.device_count())})',
+                    'GPU 设备': f'{torch.cuda.get_device_name(torch.cuda.current_device())} ({str(torch.cuda.device_count())})',
                     'hip': torch.version.hip,
                 }
             else:
                 return {
-                    'device': 'unknown'
+                    'GPU 设备': 'unknown'
                 }
         except Exception as e:
             return { 'error': e }
@@ -163,32 +163,54 @@ def get_memory():
         process = psutil.Process(os.getpid())
         res = process.memory_info()
         ram_total = 100 * res.rss / process.memory_percent()
-        ram = { 'free': gb(ram_total - res.rss), 'used': gb(res.rss), 'total': gb(ram_total) }
+        ram = { '可用': gb(ram_total - res.rss), '已用': gb(res.rss), '总': gb(ram_total) }
         mem.update({ 'ram': ram })
     except Exception as e:
         mem.update({ 'ram': e })
     if torch.cuda.is_available():
         try:
+    # 初始化 pynvml
+            pynvml.nvmlInit()
+
+            # 获取 GPU 内存信息
             s = torch.cuda.mem_get_info()
-            gpu = { 'free': gb(s[0]), 'used': gb(s[1] - s[0]), 'total': gb(s[1]) }
-            s = dict(torch.cuda.memory_stats(shared.device))
-            allocated = { 'current': gb(s['allocated_bytes.all.current']), 'peak': gb(s['allocated_bytes.all.peak']) }
-            reserved = { 'current': gb(s['reserved_bytes.all.current']), 'peak': gb(s['reserved_bytes.all.peak']) }
-            active = { 'current': gb(s['active_bytes.all.current']), 'peak': gb(s['active_bytes.all.peak']) }
-            inactive = { 'current': gb(s['inactive_split_bytes.all.current']), 'peak': gb(s['inactive_split_bytes.all.peak']) }
-            warnings = { 'retries': s['num_alloc_retries'], 'oom': s['num_ooms'] }
+            gpu = {'可用': gb(s[0]), '已用': gb(s[1] - s[0]), '总': gb(s[1])}
+
+            # 获取 GPU 内存分配、保留、活跃等信息
+            s = dict(torch.cuda.memory_stats(torch.cuda.current_device()))
+            allocated = {'current': gb(s['allocated_bytes.all.current']), 'peak': gb(s['allocated_bytes.all.peak'])}
+            reserved = {'current': gb(s['reserved_bytes.all.current']), 'peak': gb(s['reserved_bytes.all.peak'])}
+            active = {'current': gb(s['active_bytes.all.current']), 'peak': gb(s['active_bytes.all.peak'])}
+            inactive = {'current': gb(s['inactive_split_bytes.all.current']), 'peak': gb(s['inactive_split_bytes.all.peak'])}
+            warnings = {'retries': s['num_alloc_retries'], 'oom': s['num_ooms']}
+
+            # 获取 GPU 风扇转速和温度信息
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # 0 表示第一块 GPU，根据实际情况调整
+            temperature = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+            warnin  = 'OFF'
+            # 更新字典
             mem.update({
                 'gpu': gpu,
                 'gpu-active': active,
                 'gpu-allocated': allocated,
                 'gpu-reserved': reserved,
                 'gpu-inactive': inactive,
-                'events': warnings,
-                'utilization': 0,
+                'GPU活动': warnings,
+                'GPU 使用率(百分比)': 0,  
+                'GPU-温度': f'{temperature}℃',  # 添加℃符号
+                'GPU-温度自动报警': warnin, #敬请期待
             })
-            mem.update({ 'utilization': torch.cuda.utilization() }) # do this one separately as it may fail
-        except Exception:
-            pass
+
+            # 获取 GPU 利用率信息
+            mem.update({'GPU 使用率(百分比)': torch.cuda.utilization()})
+
+        except Exception as e:
+            print(f"遇到错误: {e}")
+
+        finally:
+            # 关闭 pynvml
+            pynvml.nvmlShutdown()
+
     else:
         try:
             from openvino.runtime import Core as OpenVINO_Core
@@ -299,12 +321,17 @@ def get_version():
     return version
 
 
+def get_embeddings():
+    return sorted([f'{v} ({sd_hijack.model_hijack.embedding_db.word_embeddings[v].vectors})' for i, v in enumerate(sd_hijack.model_hijack.embedding_db.word_embeddings)])
+
+
+def get_skipped():
+    return sorted([k for k in sd_hijack.model_hijack.embedding_db.skipped_embeddings.keys()])
+
+
 def get_crossattention():
     try:
-        ca = getattr(shared.opts, 'cross_attention_optimization', None)
-        if ca is None:
-            from modules import sd_hijack
-            ca = sd_hijack.model_hijack.optimization_method
+        ca = sd_hijack.model_hijack.optimization_method or getattr(shared.opts, 'cross_attention_optimization', 'none')
         return ca
     except Exception:
         return 'unknown'
@@ -363,6 +390,10 @@ def get_loras():
     return loras
 
 
+def get_lycos():
+    return []
+
+
 def get_device():
     dev = {
         'active': str(devices.device),
@@ -399,7 +430,11 @@ def get_full_data():
     global networks # pylint: disable=global-statement
     networks = {
         'models': get_models(),
+        'hypernetworks': [name for name in shared.hypernetworks],
+        'embeddings': get_embeddings(),
+        'skipped': get_skipped(),
         'loras': get_loras(),
+        'lycos': get_lycos(),
     }
     return data
 
@@ -432,17 +467,12 @@ def refresh_info_quick(_old_data = None):
 
 def refresh_info_full():
     get_full_data()
-    return data['uptime'], dict2text(data['version']), dict2text(data['state']), dict2text(data['memory']), dict2text(data['platform']), data['torch'], dict2text(data['gpu']), list2text(data['optimizations']), data['crossattention'], data['backend'], data['pipeline'], dict2text(data['libs']), dict2text(data['repos']), dict2text(data['device']), dict2text(data['model']), networks['models'], networks['loras'], data['timestamp'], data
+    return data['uptime'], dict2text(data['version']), dict2text(data['state']), dict2text(data['memory']), dict2text(data['platform']), data['torch'], dict2text(data['gpu']), list2text(data['optimizations']), data['crossattention'], data['backend'], data['pipeline'], dict2text(data['libs']), dict2text(data['repos']), dict2text(data['device']), dict2text(data['model']), networks['models'], networks['hypernetworks'], networks['embeddings'], networks['skipped'], networks['loras'], networks['lycos'], data['timestamp'], data
 
 
 ### ui definition
 
 def create_ui(blocks: gr.Blocks = None):
-    try:
-        if shared.cmd_opts.api_only:
-            return
-    except:
-        pass
     if not standalone:
         from modules.ui import ui_system_tabs # pylint: disable=redefined-outer-name
     else:
@@ -456,7 +486,6 @@ def create_ui(blocks: gr.Blocks = None):
                         timestamp = gr.Textbox(value=data['timestamp'], label = '', elem_id = 'system_info_tab_last_update', container=False)
                         refresh_quick_btn = gr.Button('Refresh state', elem_id = 'system_info_tab_refresh_btn', visible = False) # quick refresh is used from js interval
                         refresh_full_btn = gr.Button('Refresh data', elem_id = 'system_info_tab_refresh_full_btn', variant='primary')
-                        interrupt_btn = gr.Button('Send interrupt', elem_id = 'system_info_tab_interrupt_btn', variant='primary')
                     with gr.Row():
                         with gr.Column():
                             uptimetxt = gr.Textbox(data['uptime'], label = 'Server start time', lines = 1)
@@ -525,6 +554,11 @@ def create_ui(blocks: gr.Blocks = None):
                             models = gr.JSON(networks['models'], label = 'Models')
                         with gr.Column():
                             loras = gr.JSON(networks['loras'], label = 'Available LORA')
+                            lycos = gr.JSON(networks['lycos'], label = 'Available LyCORIS')
+                        with gr.Column():
+                            embeddings = gr.JSON(networks['embeddings'], label = 'Embeddings: loaded')
+                            skipped = gr.JSON(networks['skipped'], label = 'Embeddings: skipped')
+                            hypernetworks = gr.JSON(networks['hypernetworks'], label = 'Hypernetworks')
 
                 refresh_quick_btn.click(refresh_info_quick, _js='receive_system_info', show_progress = False,
                     inputs = [js],
@@ -532,9 +566,8 @@ def create_ui(blocks: gr.Blocks = None):
                 )
                 refresh_full_btn.click(refresh_info_full, show_progress = False,
                     inputs = [],
-                    outputs = [uptimetxt, versiontxt, statetxt, memorytxt, platformtxt, torchtxt, gputxt, opttxt, attentiontxt, backendtxt, pipelinetxt, libstxt, repostxt, devtxt, modeltxt, models, loras, timestamp, js]
+                    outputs = [uptimetxt, versiontxt, statetxt, memorytxt, platformtxt, torchtxt, gputxt, opttxt, attentiontxt, backendtxt, pipelinetxt, libstxt, repostxt, devtxt, modeltxt, models, hypernetworks, embeddings, skipped, loras, lycos, timestamp, js]
                 )
-                interrupt_btn.click(shared.state.interrupt, inputs = [], outputs = [])
 
     return [(system_info, 'System Info', 'system_info')]
 
